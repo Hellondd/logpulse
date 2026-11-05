@@ -1,0 +1,57 @@
+name: logpulse            # фиксирует имя проекта: том будет называться logpulse_redis-data
+
+services:
+  redis:
+    image: redis:7-alpine
+    # AOF: каждая запись попадает в журнал на диске (том), данные переживают рестарт контейнера.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+    restart: unless-stopped
+    # Порт Redis наружу НЕ публикуем: api и worker ходят к нему по внутренней сети compose.
+
+  api:
+    build: .
+    image: logpulse-app
+    environment:
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"     # доступен только с этого компьютера, а не из локальной сети
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # в slim-образе нет curl, поэтому проверяем /health средствами Python
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  worker:
+    build: .
+    image: logpulse-app
+    command: ["python", "-m", "app.worker"]
+    environment:
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      WORKER_NAME: ${WORKER_NAME:-worker-1}        # стабильное имя: после рестарта дочитает свои неподтверждённые сообщения
+      WORKER_BATCH: ${WORKER_BATCH:-100}
+      WORKER_BLOCK_MS: ${WORKER_BLOCK_MS:-2000}
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+volumes:
+  redis-data:
