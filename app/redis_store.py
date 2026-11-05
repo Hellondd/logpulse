@@ -130,3 +130,15 @@ def get_stats(r, top: int = 5) -> dict:
         "by_status": _ints(r.hgetall(STATS_STATUS)),
         "top_slow": [{"rid": rid, "duration_ms": int(score)} for rid, score in slow],
     }
+
+
+def latest_events(r, limit: int = 20) -> list[dict]:
+    """Последние события из стрима, новые первыми (XREVRANGE). Битые записи пропускаем."""
+    out = []
+    for msg_id, fields in r.xrevrange(STREAM, count=limit):
+        try:
+            event = event_from_fields(fields)
+        except (KeyError, ValueError, TypeError):
+            continue
+        out.append({"id": msg_id, **event})
+    return out

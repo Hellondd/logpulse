@@ -5,7 +5,7 @@ import redis
 
 from app.parser import parse_lines
 from app.redis_store import (PROCESSED_RIDS, SLOW, STREAM, apply_event, ensure_group,
-                             get_stats, pending_count, publish_events)
+                             get_stats, latest_events, pending_count, publish_events)
 from app.service import ingest_lines
 from app.worker import GROUP, consume_once, drain_pending, handle_messages, run
 
@@ -162,3 +162,10 @@ def test_sample_log_end_to_end(r):
     assert sum(s["by_level"].values()) == sum(s["by_service"].values()) == len(expected.valid)
     slow = sorted((e["duration_ms"] for e in expected.valid if e["duration_ms"] >= 500), reverse=True)
     assert [t["duration_ms"] for t in s["top_slow"]] == slow[:5]
+
+
+def test_latest_events_newest_first_and_limited(r):
+    publish_events(r, [ev(f"0000000{i}") for i in range(1, 5)])
+    items = latest_events(r, limit=3)
+    assert [e["rid"] for e in items] == ["00000004", "00000003", "00000002"]
+    assert items[0]["status"] == 200 and "id" in items[0]
