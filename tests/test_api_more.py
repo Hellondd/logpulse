@@ -48,15 +48,22 @@ def test_events_on_empty_redis(client):
 
 
 # ---------- /ingest: границы и особые случаи ----------
-def test_ingest_limit_1000_lines_ok_1001_rejected(client):
-    ok = client.post("/ingest", json={"lines": [line(i) for i in range(1, 1001)]})
-    assert ok.status_code == 200 and ok.json()["accepted"] == 1000
-    too_many = client.post("/ingest", json={"lines": [line(i) for i in range(1, 1002)]})
+def test_ingest_limit_100_lines_ok_101_rejected(client):
+    ok = client.post("/ingest", json={"lines": [line(i) for i in range(1, 101)]})
+    assert ok.status_code == 200 and ok.json()["accepted"] == 100
+    too_many = client.post("/ingest", json={"lines": [line(i) for i in range(1, 102)]})
     assert too_many.status_code == 422
+    assert too_many.json()["error"]["code"] == "validation_error"
+
+
+def test_ingest_line_length_limits(client):
+    assert client.post("/ingest", json={"lines": ["a" * 500]}).status_code == 200   # ровно 500 - можно
+    assert client.post("/ingest", json={"lines": ["a" * 501]}).status_code == 422   # 501 - отказ
+    assert client.post("/ingest", json={"lines": [""]}).status_code == 422          # пустая строка - отказ
 
 
 def test_ingest_errors_keep_request_line_numbers(client):
-    body = {"lines": ["мусор", line(1), "ещё мусор", line(2), ""]}
+    body = {"lines": ["мусор", line(1), "ещё мусор", line(2), "   "]}
     data = client.post("/ingest", json=body).json()
     assert (data["accepted"], data["rejected"]) == (2, 3)
     assert [e["line_no"] for e in data["errors"]] == [1, 3, 5]
@@ -81,12 +88,12 @@ def test_ingest_rejects_unicode_digits(client):
 
 
 # ---------- /events ----------
-def test_events_default_limit_is_20(client):
+def test_events_default_limit_is_10(client):
     client.post("/ingest", json={"lines": [line(i) for i in range(1, 26)]})
-    assert client.get("/events").json()["count"] == 20
+    assert client.get("/events").json()["count"] == 10
 
 
-@pytest.mark.parametrize("limit", [1, 100])
+@pytest.mark.parametrize("limit", [1, 50])
 def test_events_limit_boundaries_are_allowed(client, limit):
     client.post("/ingest", json={"lines": [line(i) for i in range(1, 4)]})
     resp = client.get("/events", params={"limit": limit})
@@ -134,7 +141,7 @@ def test_sample_log_end_to_end_through_api(client, run_worker):
     assert sum(s["by_status"].values()) == len(expected.valid)
     slow = sorted((e["duration_ms"] for e in expected.valid if e["duration_ms"] >= 500), reverse=True)
     assert [t["duration_ms"] for t in s["top_slow"]] == slow[:5]
-    assert client.get("/events", params={"limit": 100}).json()["count"] == len(expected.valid)
+    assert client.get("/events", params={"limit": 50}).json()["count"] == len(expected.valid)
 
 
 # ---------- 503: упавший Redis и таймауты ----------
@@ -155,7 +162,8 @@ def test_503_body_is_friendly_json_not_traceback(client):
     app.dependency_overrides[get_db] = lambda: FailingRedis(redis.exceptions.ConnectionError("down"))
     resp = client.get("/stats")
     assert resp.status_code == 503
-    assert resp.json() == {"detail": "Redis недоступен, попробуйте позже"}
+    assert resp.json() == {"error": {"code": "redis_unavailable",
+                                     "message": "Redis недоступен, попробуйте позже"}}
 
 
 def test_api_recovers_after_redis_comes_back(client, r):
@@ -185,3 +193,38 @@ def test_openapi_lists_all_endpoints(client):
 
 def test_swagger_docs_page_is_available(client):
     assert client.get("/docs").status_code == 200
+
+
+# ---------- единый формат ошибок ----------
+def test_422_uses_unified_error_format(client):
+    resp = client.post("/ingest", json={"lines": "abc"})
+    assert resp.status_code == 422
+    err = resp.json()["error"]
+    assert err["code"] == "validation_error"
+    assert err["details"][0]["field"] == "body.lines"
+    assert "input" not in resp.text                      # значение из запроса обратно не отдаём
+
+
+def test_422_does_not_echo_secrets_from_request(client):
+    resp = client.post("/ingest", json={"lines": [{"password": "hunter2"}]})
+    assert resp.status_code == 422
+    assert "hunter2" not in resp.text
+
+
+def test_404_uses_unified_error_format(client):
+    resp = client.get("/nope")
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "not_found"
+
+
+def test_unexpected_error_returns_500_without_traceback(r):
+    from fastapi.testclient import TestClient
+    app.dependency_overrides[get_db] = lambda: FailingRedis(RuntimeError("secret internals /srv/app/file.py"))
+    try:
+        with TestClient(app, raise_server_exceptions=False) as c:
+            resp = c.get("/stats")
+    finally:
+        app.dependency_overrides.clear()
+    assert resp.status_code == 500
+    assert resp.json() == {"error": {"code": "internal_error", "message": "Внутренняя ошибка сервера"}}
+    assert "secret internals" not in resp.text and "Traceback" not in resp.text
